@@ -1,0 +1,129 @@
+# condição para buildar ao ter db_files.sql editado
+trigger:
+  branches:
+    include:
+      - master
+      - pre-prod
+      - develop
+      - homolog
+  paths:
+    include:
+      - db_files.sql
+
+pr:
+  branches:
+    include:
+      - develop #CORPD0
+
+variables:
+  - name: isDevelop
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/develop')]
+
+stages:
+  - stage: ContinuosIntegration
+    pool:
+      name: Azure Pipelines
+      vmImage: "windows-2022"
+    jobs:
+      - job: ContinuosIntegration
+        steps:
+          - task: PowerShell@2
+            displayName: "Generate packages for application"
+            inputs:
+              targetType: filePath
+              filePath: "./src/main/resources/db/devops/gera-pacotes.ps1"
+              arguments: "-DefinitionName $(Build.DefinitionName) -BuildNumber $(Build.BuildNumber)"
+
+          - task: PythonScript@0
+            displayName: "Object validation (Encoding)"
+            inputs:
+              versionSpec: "3.x" # Versão que será usada de Python
+              scriptSource: "filePath"
+              scriptPath: "./src/main/resources/db/devops/encoding-ci.py"
+              arguments: "-DefinitionName $(Build.DefinitionName) -BuildNumber $(Build.BuildNumber)"
+
+          # Copia os arquivos criados pelo executavel para dentro do artefato
+          - task: CopyFiles@2
+            displayName: "Copy Files to $(Build.ArtifactStagingDirectory)"
+            inputs:
+              SourceFolder: ./
+              Contents: |
+                script/**
+                backup/**
+                chamador-$(Build.DefinitionName)-$(Build.BuildNumber).sql
+                chamador-status-$(Build.DefinitionName)-$(Build.BuildNumber).sql
+                chamador-backup-$(Build.DefinitionName)-$(Build.BuildNumber).sql
+                src/main/resources/db/devops/**
+                db_files.sql
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+          #faz a publicação dos artefatos gerados para execução
+          - task: PublishBuildArtifacts@1
+            displayName: "Generate new artifact from scripts"
+            inputs:
+              ArtifactName: "$(Build.DefinitionName)-$(Build.BuildNumber)"
+
+  - stage: CDReleaseCORPD0
+    dependsOn: ContinuosIntegration
+    condition: and(succeeded(), eq(variables.isDevelop, 'true'))
+    variables:
+      - group: deploy-corpd0 #GRUPO COM VARIAVEIS DA CORPD0
+    jobs:
+      - deployment: AwaitingApprovalCodeAdmin
+        environment:
+          name: "deploy_corpd0"
+        pool: lbr001001-271
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # NOME DA BASE
+                - bash: |
+                    cd ../$(Build.DefinitionName)-$(Build.BuildNumber)
+                    $(ORACLE_HOME)/sqlplus $(usuario)/$(senha)@$(servidor):$(porta)/$(sid) @src/main/resources/db/devops/select_globalname.sql
+                  timeoutInMinutes: 5
+                  displayName: "BASE"
+
+                # GERAR BACKUP
+                - bash: |
+                    cd ../$(Build.DefinitionName)-$(Build.BuildNumber)
+                    $(ORACLE_HOME)/sqlplus $(usuario)/$(senha)@$(servidor):$(porta)/$(sid) @chamador-backup-$(Build.DefinitionName)-$(Build.BuildNumber).sql
+                  timeoutInMinutes: 60
+                  displayName: "Generate Backup"
+
+                # Copiar Backup
+                - task: CopyFiles@2
+                  displayName: "Copy Files to Backup"
+                  inputs:
+                    SourceFolder: ../$(Build.DefinitionName)-$(Build.BuildNumber)
+                    Contents: |
+                      script/**
+                      backup/**
+                    TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+                # Publicar Backup
+                - task: PublishBuildArtifacts@1
+                  displayName: "Generate new artifact from backup"
+                  inputs:
+                    ArtifactName: "$(Build.DefinitionName)-$(Build.BuildNumber)-Mapfre"
+
+                # ComandoSQL do chamador
+                - bash: |
+                    cd ../$(Build.DefinitionName)-$(Build.BuildNumber)
+                    $ORACLE_HOME/sqlplus $(usuario)/$(senha)@$(servidor):$(porta)/$(sid) @chamador-$(Build.DefinitionName)-$(Build.BuildNumber).sql
+                  displayName: "Aplicando alterações na CORPD0"
+
+                # ComandoSQL InvalidObject
+                - bash: |
+                    cd ../$(Build.DefinitionName)-$(Build.BuildNumber)
+                    TEMP_FILE=temp-invalid-objects.txt
+                    FILE_BEFORE=temp-num-invalid-objects.txt
+                    while read LINE; do
+                    if [[ -n "${LINE// /}" ]] && [ "$LINE" != "OBJETOS_INVALIDOS" ] && [ "$LINE" != "-----------------" ]; then
+                        echo "$LINE" >> $FILE_BEFORE
+                    fi
+                    done < $TEMP_FILE
+                    rm $TEMP_FILE
+                  displayName: "Objetos Invalidados"
+                - script: echo "Welcome, CORPD0 !!!"
+                  displayName: "Welcome"
